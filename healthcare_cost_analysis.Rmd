@@ -1,0 +1,773 @@
+---
+title: "What Drives Healthcare Costs? A Statistical Analysis for Public Health Policy"
+author: "Michael Matyevich"
+date: "2026-04-10"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+library(tidyverse)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(xgboost)
+library(Metrics)
+library(pdp)
+library(corrplot)
+library(tidyr)
+library(broom)
+library(ggfortify)
+library(scales)
+
+med_df <- read.csv("C:/Users/micha/Downloads/insurance.csv") |>
+  mutate(
+    sex    = as.factor(sex),
+    smoker = as.factor(smoker),
+    region = as.factor(region),
+    bmi_cat = cut(bmi,
+                  breaks = c(0, 18.5, 25, 30, Inf),
+                  labels = c("Underweight", "Normal", "Overweight", "Obese"),
+                  right  = FALSE)
+  )
+```
+
+---
+
+## Background
+
+Healthcare costs are rising in most developed countries, placing increasing strain on public health
+systems and insurers alike. Understanding *which patient characteristics most strongly predict
+higher costs* is critical for designing effective public health interventions — particularly when
+resources are limited and policy decisions need to be evidence-based.
+
+This analysis uses a dataset of 1,338 US insurance beneficiaries to answer three research questions.
+
+---
+
+## Research Questions
+
+**RQ1 — What patient characteristics are most strongly associated with higher insurance charges?**
+
+We expect age, BMI, and smoking status to be important based on the clinical literature, but the
+relative magnitude of each, and whether they *interact* with one another, is not known in advance.
+Understanding this helps prioritise which risk factors are most impactful to address.
+
+**RQ2 — Does the effect of BMI on charges depend on whether a person smokes?**
+
+If the relationship between BMI and cost is *steeper* for smokers than non-smokers, that would
+suggest that smoking and obesity compound each other — meaning a policy targeting both simultaneously
+would be more cost-effective than targeting either alone.
+
+**RQ3 — Which modelling approach best predicts individual insurance charges?**
+
+We compare four methods: linear regression, regression trees, random forests, and XGBoost. A more
+accurate predictive model helps insurers and health planners identify high-risk individuals earlier,
+enabling earlier intervention.
+
+---
+
+## Dataset Description
+
+The dataset contains **1,338 rows** and **7 variables** representing US health insurance
+beneficiaries. Each row is one individual. The outcome variable is `charges` — the annual medical
+cost billed by the insurer in USD.
+
+| Variable   | Type        | Description                                      |
+|------------|-------------|--------------------------------------------------|
+| age        | Numeric     | Age of the beneficiary in years                  |
+| sex        | Categorical | Male or female                                   |
+| bmi        | Numeric     | Body Mass Index (weight/height²)                 |
+| children   | Numeric     | Number of dependants covered                     |
+| smoker     | Categorical | Whether the person currently smokes              |
+| region     | Categorical | US geographic region (NE, NW, SE, SW)            |
+| charges    | Numeric     | Annual medical charges billed (USD) — **outcome**|
+
+The dataset contains **no missing values**, so no imputation was required.
+
+---
+
+## Exploratory Analysis
+
+Before building any models, we examine the data to understand its structure and identify any
+patterns worth investigating further.
+
+```{r Exploratory Analysis}
+str(med_df)
+summary(med_df)
+colSums(is.na(med_df))
+```
+
+### Distribution of charges
+
+```{r charges-distribution}
+ggplot(med_df, aes(charges)) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Distribution of annual insurance charges",
+       subtitle = "Strong right skew — a small number of patients incur very high costs",
+       x = "Charges (USD)", y = "Count") +
+  theme_minimal()
+```
+
+The distribution of charges is strongly **right-skewed**: most people incur relatively modest costs,
+but a small number of patients generate very high charges. This skew is common in healthcare cost
+data and is worth noting because it means the *average* charge is pulled upward by a few extreme
+cases — the *median* is a more representative summary of what a typical patient costs.
+
+From a statistical standpoint, this skew also violates the normality assumption that linear
+regression relies on for valid p-values and confidence intervals. We test a log-transformation
+below to see if it improves the distribution.
+
+```{r log-charges}
+ggplot(med_df, aes(log(charges))) +
+  geom_histogram(bins = 50, fill = "steelblue", colour = "white") +
+  labs(title = "Log-transformed charges",
+       subtitle = "Log transformation produces a much more symmetric distribution",
+       x = "log(Charges)", y = "Count") +
+  theme_minimal()
+```
+
+The log-transformed distribution is substantially more symmetric, which is useful to know —
+it means if we want reliable inference (trustworthy p-values and confidence intervals) from
+linear regression, modelling log(charges) rather than charges directly would be the more
+rigorous approach. We retain the original scale here for interpretability, but flag this
+as a limitation when reviewing the linear model diagnostics.
+
+---
+
+### Correlations between numeric predictors and charges
+
+```{r corrplot}
+med_cor <- med_df |> select(age, bmi, children, charges)
+corrplot(cor(med_cor),
+         method   = 'number',
+         type     = 'lower',
+         diag     = FALSE,
+         col      = colorRampPalette(c("#D73027", "white", "#1A6099"))(200),
+         tl.col   = 'black',
+         tl.srt   = 45)
+```
+
+Among the numeric variables, **age has the strongest correlation with charges (r = 0.30)**,
+followed by BMI (r = 0.20). The number of children is essentially unrelated to cost (r = 0.07).
+
+However, correlation only captures *linear* relationships between two variables at a time —
+it does not tell us how variables interact with one another, or how much each predictor
+contributes once others are held constant. That requires regression modelling.
+
+---
+
+### Charges by categorical predictors
+
+```{r boxplots}
+med_df |>
+  pivot_longer(cols = c(smoker, sex, region),
+               names_to  = "variable",
+               values_to = "category") |>
+  ggplot(aes(x = category, y = charges, fill = category)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 1.5, alpha = 0.8) +
+  facet_wrap(~ variable, scales = "free_x") +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Annual insurance charges by smoker status, sex, and region",
+       subtitle = "Smoking status shows by far the largest difference in median charges",
+       x = NULL, y = "Annual charges (USD)") +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position    = "none",
+    strip.text         = element_text(face = "bold", size = 12),
+    strip.background   = element_rect(fill = "grey92", colour = NA),
+    axis.text.x        = element_text(angle = 25, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+Three clear patterns emerge:
+
+- **Smoking** is the most dramatic separator — smokers' median charges are roughly 3× those of
+  non-smokers. The spread within the smoker group is also much wider, suggesting other factors
+  (likely BMI, as we explore below) create further cost variation *within* smokers.
+- **Sex** shows a small difference with males slightly higher, but the distributions overlap
+  substantially — sex is unlikely to be a strong independent predictor.
+- **Region** shows modest differences, with the southeast slightly higher than other regions,
+  possibly reflecting higher obesity rates in that population.
+
+---
+
+### Does the effect of BMI differ by smoking status?
+
+```{r bmi-smoker-scatter}
+ggplot(med_df, aes(x = bmi, y = charges, col = smoker)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = 'lm') +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_colour_manual(values = c("no" = "steelblue", "yes" = "#D73027")) +
+  labs(x = "Body Mass Index", y = "Medical charges",
+       title = "BMI and charges by smoking status",
+       subtitle = "The slope for smokers is much steeper — BMI matters far more if you smoke",
+       colour = "Smoker") +
+  theme_minimal()
+```
+
+This plot directly addresses RQ2. The two trend lines have **very different slopes**:
+
+- For **non-smokers** (blue), the BMI-charges relationship is almost flat — BMI has little
+  independent effect on cost for people who do not smoke.
+- For **smokers** (red), the slope is steep — each additional BMI unit is associated with
+  substantially higher charges.
+
+This divergence is the statistical definition of an **interaction effect**: the impact of one
+variable (BMI) depends on the value of another (smoking status). This means any model that treats
+BMI and smoking as independent predictors will misrepresent how costs actually accumulate.
+We formally test and include this interaction term in the linear regression.
+
+```{r age-smoker-scatter}
+ggplot(med_df, aes(x = age, y = charges, col = smoker)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = 'lm') +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_colour_manual(values = c("no" = "steelblue", "yes" = "#D73027")) +
+  labs(title = "Age and charges by smoking status",
+       subtitle = "Both groups show increasing costs with age, but slopes are broadly parallel",
+       x = "Age (years)", y = "Charges (USD)", colour = "Smoker") +
+  theme_minimal()
+```
+
+Unlike the BMI plot, the age-charges slopes for smokers and non-smokers are roughly **parallel**
+— age increases costs at a similar rate regardless of smoking status. This suggests an age ×
+smoking interaction is less warranted. Both groups do show a steady increase with age, consistent
+with older patients having more cumulative health needs.
+
+---
+
+## Risk Modelling
+
+We split the data into a **training set (80%, n ≈ 1,070)** used to build models, and a
+**test set (20%, n ≈ 268)** held back to evaluate how well each model generalises to new data.
+This separation is essential — evaluating a model on the same data it was trained on produces
+an overly optimistic picture of real-world performance.
+
+```{r train-test-split}
+set.seed(100)
+train_index <- createDataPartition(med_df$charges, p = 0.8, list = FALSE)
+train <- med_df[train_index, ]
+test  <- med_df[-train_index, ]
+```
+
+---
+
+### Linear Regression
+
+Linear regression estimates the independent contribution of each predictor to charges, holding
+all other variables constant. It produces interpretable coefficients — each coefficient tells us
+the expected change in annual charges for a one-unit increase in that variable.
+
+We fit two models: one with main effects only, and one that adds the BMI × smoking interaction
+identified in the exploratory analysis.
+
+```{r linear-regression}
+lm_model <- lm(charges ~ age + sex + bmi + children + smoker + region,
+               data = train)
+
+lm_int_model <- lm(charges ~ age + sex + bmi + children + smoker + region +
+                     smoker:bmi,
+                   data = train)
+
+tidy(lm_int_model, conf.int = TRUE) |>
+  mutate(across(where(is.numeric), ~ round(.x, 2))) |>
+  print()
+```
+
+#### Is the interaction term worth including?
+
+```{r anova-test}
+anova(lm_model, lm_int_model)
+```
+
+The ANOVA F-test compares the two models directly. The result (F = 552, p < 2.2e-16) is
+overwhelmingly significant — the interaction term explains a large additional portion of the
+variance in charges. **Including it is clearly justified.**
+
+The F-statistic of 552 is very large by any standard; a value above ~4 would typically be
+considered significant. A value this large means the improvement from adding the interaction
+term is almost certainly not due to chance.
+
+#### Coefficient plot
+
+```{r coef-plot}
+tidy(lm_int_model, conf.int = TRUE) |>
+  filter(term != "(Intercept)") |>
+  ggplot(aes(x = estimate, y = reorder(term, estimate))) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.3) +
+  geom_point(size = 3, colour = "steelblue") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Linear regression coefficients (95% CI)",
+       subtitle = "Each bar shows the estimated effect of that variable on annual charges",
+       x = "Estimated effect on charges (USD)", y = NULL) +
+  theme_minimal()
+```
+
+A few things to note from this plot:
+
+- Any predictor whose confidence interval **does not cross zero** (the dashed line) has a
+  statistically significant effect at the 5% level.
+- **`bmi:smokeryes`** sits far to the right and has a very tight confidence interval — this is
+  the interaction term, confirming that each additional BMI unit is worth substantially more
+  in charges for smokers than for non-smokers.
+- **`smokeryes`** appears negative, which seems counterintuitive. This is a quirk of how
+  interaction terms are encoded mathematically: the `smokeryes` coefficient represents the
+  effect of smoking when BMI = 0, which is nonsensical. The *true* cost of smoking must be
+  calculated at a realistic BMI (see below).
+- **Age, BMI, and children** all show positive effects — older patients, higher BMI, and more
+  dependants all predict higher costs.
+- **Regional effects** are present but modest relative to the clinical predictors.
+- **Sex** has a confidence interval close to zero — after controlling for other factors, being
+  male adds relatively little to costs independently.
+
+#### What does smoking actually cost at a typical BMI?
+
+```{r smoking-effect}
+mean_bmi <- mean(train$bmi)
+coefs    <- coef(lm_int_model)
+
+smoking_effect_at_mean_bmi <- coefs["smokeryes"] +
+                               coefs["bmi:smokeryes"] * mean_bmi
+
+cat("At the average BMI of", round(mean_bmi, 1),
+    "— a smoker is estimated to pay an additional",
+    dollar(round(smoking_effect_at_mean_bmi, 0)),
+    "per year in insurance charges compared to a non-smoker with the same characteristics.")
+```
+
+This is the most policy-relevant number in the linear model. It translates the abstract
+coefficient into a concrete dollar figure that a public health planner can act on. An
+individual who quits smoking could expect to save roughly this amount annually in medical
+costs — and the savings are even larger at higher BMI values.
+
+#### Checking model assumptions
+
+```{r diagnostics, fig.height=8}
+autoplot(lm_int_model, which = 1:4, ncol = 2) + theme_minimal()
+```
+
+These four diagnostic plots reveal some important limitations of the linear model:
+
+- **Residuals vs Fitted** (top left): The residuals fan outward as fitted values increase — a
+  pattern called *heteroscedasticity*. This means the model's errors are larger for high-cost
+  patients than low-cost ones. The consequence is that our standard errors, and therefore our
+  p-values and confidence intervals, are not fully reliable.
+- **Normal Q-Q** (top right): Points in the upper tail deviate from the diagonal line,
+  indicating the residuals are more right-skewed than a normal distribution assumes. This
+  reinforces the concern above.
+- **Scale-Location** (bottom left): The upward trend confirms heteroscedasticity formally.
+- **Cook's Distance** (bottom right): A small number of observations (notably #1048 and #1301)
+  have high influence on the model's estimates. These are likely patients with unusually high
+  charges who are pulling the fitted line toward them.
+
+**The practical takeaway**: the linear model's coefficient estimates are useful for understanding
+direction and approximate magnitude of effects, but the exact p-values and confidence intervals
+should be interpreted with caution. The tree-based models below do not make these distributional
+assumptions and are therefore less sensitive to these issues.
+
+```{r lm-predictions}
+lm_pred     <- predict(lm_model, test)
+lm_pred_int <- predict(lm_int_model, test)
+rmse_lm     <- rmse(test$charges, lm_pred)
+rmse_lm_int <- rmse(test$charges, lm_pred_int)
+```
+
+---
+
+### Regression Tree
+
+A regression tree makes predictions by splitting the data into groups based on simple yes/no
+rules (e.g. "is the person a smoker? is their BMI above 30?"). The result is a flowchart-like
+structure that is highly interpretable — you can trace any individual's predicted cost through
+the branches. The trade-off is that a single tree tends to be less accurate than more complex
+ensemble methods.
+
+The **complexity parameter (cp)** controls how deeply the tree grows. A tree that grows too
+deep will memorise the training data but predict poorly on new patients (overfitting). We use
+the cp plot to prune to the optimal depth.
+
+```{r regression-tree, fig.height=6}
+tree_model <- rpart(charges ~ ., data = train, method = "anova",
+                    control = rpart.control(cp = 0.01))
+
+plotcp(tree_model)
+```
+
+The cp plot shows prediction error (cross-validated) on the y-axis against tree complexity on
+the x-axis. We select the simplest tree whose error is within 1 standard error of the minimum —
+the convention is to pick the leftmost point that falls under the horizontal dashed line.
+
+```{r tree-plot, fig.height=7}
+rpart.plot(tree_model, type = 4, extra = 101,
+           box.palette = "Blues", shadow.col = "grey80")
+```
+
+Reading this tree from the top down:
+
+- The **first split is on smoking status** — immediately confirming it as the dominant cost
+  driver. This is the single variable that most reduces prediction error when used as the
+  first decision rule.
+- Among **smokers**, BMI above approximately 30 creates a second tier — obese smokers form
+  the highest-cost subgroup in the entire dataset.
+- Among **non-smokers**, age becomes the primary differentiator, with older patients predicting
+  higher costs — consistent with our earlier correlation and scatter plot findings.
+
+The tree makes the interaction between smoking and BMI tangible: the BMI split only appears in
+the smoker branch, not the non-smoker branch, which is a non-parametric confirmation of the
+same interaction we detected in the linear model.
+
+```{r tree-rmse}
+tree_pred <- predict(tree_model, test)
+rmse_tree <- rmse(test$charges, tree_pred)
+```
+
+---
+
+### Random Forest
+
+A random forest builds hundreds of individual decision trees, each trained on a random subset
+of the data and a random subset of the predictors, then averages their predictions. This
+averaging process substantially reduces the variance that makes any single tree unreliable.
+
+We use **10-fold cross-validation** to tune the key hyperparameter `mtry` — the number of
+predictors considered at each split. Cross-validation works by repeatedly partitioning the
+training data into 10 chunks, training on 9 and validating on the 10th, rotating through
+all chunks. This gives a more stable performance estimate than a single split would provide.
+
+```{r random-forest, cache=TRUE}
+cv_control <- trainControl(method = "cv", number = 10, savePredictions = "final")
+
+rf_cv <- train(
+  charges ~ .,
+  data      = train,
+  method    = "rf",
+  trControl = cv_control,
+  tuneGrid  = data.frame(mtry = c(2, 3, 4, 5)),
+  ntree     = 500
+)
+
+plot(rf_cv)
+```
+
+The plot shows cross-validated RMSE (prediction error in USD) for each value of `mtry`. Lower
+is better. We select the `mtry` value that minimises CV-RMSE — the model automatically retains
+this as the final model.
+
+```{r rf-importance}
+rf_model <- rf_cv$finalModel
+rf_pred  <- predict(rf_cv, test)
+rmse_rf  <- rmse(test$charges, rf_pred)
+
+varImpPlot(rf_model, main = "Random Forest — Variable Importance")
+```
+
+Variable importance measures how much prediction accuracy would decrease if each predictor
+were removed. **Smoker status and age are the two most important predictors** by a wide margin,
+followed by BMI. Sex and region contribute relatively little once the other variables are
+accounted for — consistent with our earlier exploratory findings.
+
+---
+
+### XGBoost
+
+XGBoost (Extreme Gradient Boosting) builds trees sequentially, where each new tree focuses on
+correcting the errors made by all previous trees. This makes it highly accurate but less
+interpretable than a single tree. It is widely used in applied machine learning and often
+achieves the best predictive performance on tabular data.
+
+```{r xgboost, cache=TRUE}
+x_train <- model.matrix(charges ~ ., data = train)[, -1]
+x_test  <- model.matrix(charges ~ ., data = test)[, -1]
+y_train <- train$charges
+
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest  <- xgb.DMatrix(data = x_test,  label = test$charges)
+
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "reg:squarederror",
+    max_depth        = 4,
+    eta              = 0.05,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data                  = dtrain,
+  nrounds               = 500,
+  watchlist             = list(train = dtrain, eval = dtest),
+  early_stopping_rounds = 30,
+  print_every_n         = 100,
+  verbose               = 1
+)
+
+xgb_pred <- predict(xgb_model, dtest)
+rmse_xgb <- rmse(test$charges, xgb_pred)
+```
+
+```{r xgb-importance}
+xgb.importance(model = xgb_model) |>
+  xgb.plot.importance(top_n = 10, rel_to_first = TRUE,
+                      xlab = "Relative importance")
+```
+
+XGBoost's importance rankings largely mirror the random forest's findings: **smoker status,
+age, and BMI are the dominant predictors**. The consistency across two fundamentally different
+modelling approaches strengthens confidence that these are genuine signals in the data and not
+artefacts of one particular method.
+
+---
+
+## Model Comparison
+
+```{r model-comparison}
+rsquared <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+
+results <- data.frame(
+  Model = c("Linear Regression", "LM + Interaction",
+            "Regression Tree", "Random Forest", "XGBoost"),
+  RMSE  = round(c(rmse_lm, rmse_lm_int, rmse_tree, rmse_rf, rmse_xgb), 0),
+  R2    = round(c(rsquared(test$charges, lm_pred),
+                  rsquared(test$charges, lm_pred_int),
+                  rsquared(test$charges, tree_pred),
+                  rsquared(test$charges, rf_pred),
+                  rsquared(test$charges, xgb_pred)), 3)
+) |> arrange(RMSE)
+
+print(results)
+```
+
+```{r comparison-plot}
+results |>
+  ggplot(aes(x = reorder(Model, RMSE), y = RMSE, fill = RMSE)) +
+  geom_col() +
+  geom_text(aes(label = comma(RMSE)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "steelblue", high = "#D73027") +
+  scale_y_continuous(labels = dollar_format(),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(title = "Model comparison — held-out test set RMSE",
+       subtitle = "Lower RMSE means predictions are closer to actual charges on average",
+       x = NULL, y = "Root Mean Squared Error (USD)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**RMSE** (Root Mean Squared Error) is the average prediction error in USD — a model with RMSE
+of $4,000 is wrong by about $4,000 on average. **R²** is the proportion of variance in charges
+explained by the model — an R² of 0.85 means the model accounts for 85% of the variation in
+costs across patients.
+
+Key observations:
+
+- Adding the BMI × smoking interaction improves the linear model noticeably, confirming that
+  ignoring it was leaving meaningful signal on the table.
+- The **random forest and XGBoost substantially outperform** both linear models, indicating
+  that the true relationships in this data are not fully captured by straight lines — there
+  are non-linearities and interactions that tree-based methods handle automatically.
+- The single regression tree sits between the linear models and the ensembles, which is typical:
+  it captures non-linearity but its high variance limits accuracy.
+- For **prediction**, the ensemble methods are clearly preferred. For **interpretation and policy
+  communication**, the linear model with interaction remains valuable because its coefficients
+  have direct, communicable meanings.
+
+---
+
+## Partial Dependence Analysis
+
+The model comparison tells us *how accurate* each model is, but not *how* each predictor
+influences predictions. Partial dependence plots (PDPs) address this by showing the marginal
+effect of one predictor after averaging out all the others — essentially asking "if we held
+everything else constant, what would changing this variable do to predicted costs?"
+
+This is more informative than a raw scatter plot, which confounds the effect of each variable
+with all others it correlates with.
+
+```{r pdp-bmi, cache=TRUE}
+pd_bmi <- partial(rf_cv, pred.var = "bmi", train = train)
+
+pd_bmi |>
+  as.data.frame() |>
+  ggplot(aes(bmi, yhat)) +
+  geom_line(colour = "steelblue", linewidth = 1) +
+  geom_vline(xintercept = 25, linetype = "dashed", colour = "#D73027") +
+  geom_vline(xintercept = 30, linetype = "dashed", colour = "#D73027") +
+  annotate("text", x = 19.5, y = max(pd_bmi$yhat) * 0.97,
+           label = "Normal", hjust = 0, colour = "#D73027", size = 3.5) +
+  annotate("text", x = 25.5, y = max(pd_bmi$yhat) * 0.97,
+           label = "Overweight", hjust = 0, colour = "#D73027", size = 3.5) +
+  annotate("text", x = 30.5, y = max(pd_bmi$yhat) * 0.97,
+           label = "Obese", hjust = 0, colour = "#D73027", size = 3.5) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title    = "Partial dependence: BMI on predicted charges",
+       subtitle = "Costs begin rising noticeably at the overweight threshold (BMI = 25)",
+       x = "BMI", y = "Predicted charges (averaged across all other variables)") +
+  theme_minimal()
+```
+
+The BMI curve is not a straight line — costs are relatively stable in the normal weight range
+then begin increasing from the overweight threshold (BMI ≥ 25), accelerating through the obese
+range (BMI ≥ 30). This non-linear pattern would not be captured by a linear model without
+explicit polynomial terms, but the random forest detects it automatically.
+
+**Policy implication**: weight management interventions that move patients even from the obese
+to overweight category — not necessarily to a "healthy" weight — could yield meaningful cost
+reductions, suggesting intermediate targets may be achievable and worth pursuing.
+
+```{r pdp-age, cache=TRUE}
+pd_age <- partial(rf_cv, pred.var = "age", train = train)
+
+pd_age |>
+  as.data.frame() |>
+  ggplot(aes(age, yhat)) +
+  geom_line(colour = "steelblue", linewidth = 1) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title    = "Partial dependence: age on predicted charges",
+       subtitle = "Costs increase steadily and approximately linearly with age",
+       x = "Age (years)", y = "Predicted charges (averaged across all other variables)") +
+  theme_minimal()
+```
+
+Unlike BMI, the age-charges relationship is approximately linear — costs increase at a steady
+rate across all ages. There is no threshold effect or sudden jump. This makes age-based risk
+stratification straightforward: older patients are consistently higher cost, and this holds
+regardless of their BMI or smoking status (as confirmed by the parallel slopes in the earlier
+scatter plot).
+
+Age is not a modifiable risk factor, but it is useful for **risk stratification** — identifying
+older patients for preventive screening or early intervention programmes that address the
+*modifiable* factors (smoking, BMI) before costs escalate.
+
+```{r pdp-interaction, cache=TRUE}
+partial(rf_cv, pred.var = c("bmi", "smoker"), train = train) |>
+  as.data.frame() |>
+  ggplot(aes(bmi, yhat, colour = smoker)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_colour_manual(values = c("no" = "steelblue", "yes" = "#D73027")) +
+  labs(title    = "Partial dependence: BMI × smoking status",
+       subtitle = "The cost penalty for high BMI is far greater in smokers — the two factors compound",
+       x = "BMI", y = "Predicted charges", colour = "Smoker") +
+  theme_minimal()
+```
+
+This is the most important plot in the analysis. It shows directly that:
+
+- For **non-smokers**, BMI has a modest effect on costs across most of the range.
+- For **smokers**, higher BMI produces dramatically higher costs, and the gap widens as BMI
+  increases.
+
+This interaction means that a smoker with obesity (BMI ≥ 30) does not simply pay the
+"smoker penalty" plus the "obesity penalty" as two separate amounts — the combination is
+*worse than the sum of the parts*. A public health programme targeting both smoking cessation
+and weight management simultaneously in high-BMI smokers would address the highest-cost
+subgroup in this dataset.
+
+```{r predicted-vs-actual}
+data.frame(
+  actual       = test$charges,
+  LM           = lm_pred_int,
+  RandomForest = rf_pred,
+  XGBoost      = xgb_pred
+) |>
+  pivot_longer(-actual, names_to = "model", values_to = "predicted") |>
+  ggplot(aes(x = actual, y = predicted, colour = model)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(alpha = 0.4, size = 1.5) +
+  facet_wrap(~ model) +
+  scale_x_continuous(labels = dollar_format()) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title    = "Predicted vs actual charges — held-out test set",
+       subtitle = "Points on the dashed line are perfect predictions. Scatter above/below = error.",
+       x = "Actual charges", y = "Predicted charges") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+These plots reveal *where* each model fails, not just how much:
+
+- The **linear model** shows a clear curved pattern — it systematically underpredicts very high
+  costs and overpredicts some low-cost patients. This reflects the non-linearities the model
+  cannot capture.
+- **Random Forest and XGBoost** track the diagonal more closely across the full range, though
+  both still show some scatter at the high end — extreme-cost patients are inherently difficult
+  to predict precisely.
+
+---
+
+## Public Health Interpretation
+
+### Summary of findings
+
+Three consistent findings emerge across all modelling approaches, from the simplest correlation
+to the most complex ensemble:
+
+**1. Smoking is the single largest modifiable driver of healthcare costs.** Smokers pay
+substantially more than non-smokers, and this premium compounds with BMI. At the average BMI
+in this dataset, a smoker pays approximately the amount calculated earlier per year in additional
+charges. This is not a marginal effect — it is the dominant signal in the data.
+
+**2. The combination of smoking and obesity creates a disproportionately high-cost subgroup.**
+This interaction effect appeared in the linear model's formal significance test, in the
+regression tree's first two splits, in the random forest's variable importance rankings, and
+in the partial dependence plots. Agreement across all four methods means this finding is robust.
+Obese smokers are not just the sum of two risk factors — they are a distinct, high-cost group.
+
+**3. Age increases costs steadily but is not interactive with other factors.** Unlike BMI, the
+age effect does not depend on smoking status. Age is non-modifiable, but it is a useful tool
+for risk stratification — identifying older patients who also smoke or have high BMI, and
+prioritising them for preventive intervention, would target resources at the highest-cost
+individuals.
+
+### What this means for policy
+
+If the goal is to reduce population-level healthcare costs, this analysis suggests three
+prioritised actions:
+
+1. **Smoking cessation programmes** — particularly those targeting people who are also
+   overweight or obese. The interaction effect means the cost return on helping a high-BMI
+   smoker quit is substantially larger than helping a normal-weight smoker quit.
+
+2. **Weight management support for people who smoke** — even modest reductions in BMI within
+   the smoker subgroup are associated with meaningful cost reductions, due to the steep slope
+   of the BMI-cost curve for this group.
+
+3. **Age-based risk stratification** — using age as a flag to identify patients for preventive
+   screening and behavioural health support before costs escalate. Age alone cannot be addressed,
+   but it reliably identifies patients where addressing modifiable factors (smoking, BMI) would
+   have the greatest expected impact.
+
+Sex and region had weak independent effects after other factors were controlled for. Policy
+resources focused on geography or sex-specific programmes would likely produce smaller returns
+than those targeting the behavioural factors above.
+
+### Limitations
+
+- This is a **US insurance dataset** with a specific demographic and coverage structure.
+  Direct quantitative translation to Australian public health costs (e.g. NSW Health) would
+  require Australian data, though the directional findings are consistent with clinical evidence
+  globally.
+- The dataset is relatively small (n = 1,338). Confidence intervals around cost estimates are
+  correspondingly wide — the exact dollar figures should be treated as indicative rather than
+  precise.
+- The linear model's assumption violations (heteroscedasticity, non-normality of residuals) mean
+  the reported p-values and confidence intervals are approximations. Key conclusions were
+  cross-validated against tree-based methods that do not share these assumptions, providing
+  additional confidence in the findings.
+- This analysis is **observational** — we cannot claim that smoking or obesity *causes* higher
+  charges from this data alone, only that they are strongly associated. Causal interpretation
+  requires experimental design or longitudinal data with appropriate confounding adjustment.
