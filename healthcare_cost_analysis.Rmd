@@ -27,16 +27,19 @@ library(tidyr)
 library(broom)
 library(ggfortify)
 library(scales)
+library(here)
 
-med_df <- read.csv("C:/Users/micha/Downloads/insurance.csv") |>
+med_df <- read.csv(here("data", "insurance.csv")) |>
   mutate(
     sex    = as.factor(sex),
     smoker = as.factor(smoker),
     region = as.factor(region),
-    bmi_cat = cut(bmi,
-                  breaks = c(0, 18.5, 25, 30, Inf),
-                  labels = c("Underweight", "Normal", "Overweight", "Obese"),
-                  right  = FALSE)
+    bmi_cat = cut(
+      bmi,
+      breaks = c(0, 18.5, 25, 30, Inf),
+      labels = c("Underweight", "Normal", "Overweight", "Obese"),
+      right  = FALSE
+    )
   )
 ```
 
